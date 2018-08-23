@@ -31,6 +31,7 @@
 #include <ngx_http.h>
 #include <ngx_md5.h>
 #include <ldap.h>
+#include <openssl/opensslv.h>
 
 // used for manual warnings
 #define XSTR(x) STR(x)
@@ -91,6 +92,8 @@ typedef struct {
     ngx_flag_t referral;
 
     ngx_uint_t connections;
+    ngx_uint_t max_down_retries;
+    ngx_uint_t max_down_retries_count;
     ngx_msec_t connect_timeout;
     ngx_msec_t reconnect_timeout;
     ngx_msec_t bind_timeout;
@@ -207,6 +210,7 @@ static ngx_int_t ngx_http_auth_ldap_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_auth_ldap_init_cache(ngx_cycle_t *cycle);
 static void ngx_http_auth_ldap_close_connection(ngx_http_auth_ldap_connection_t *c);
 static void ngx_http_auth_ldap_read_handler(ngx_event_t *rev);
+static void ngx_http_auth_ldap_reconnect_handler(ngx_event_t *);
 static ngx_int_t ngx_http_auth_ldap_init_connections(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_auth_ldap_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx,
@@ -411,6 +415,13 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
         return ngx_http_auth_ldap_parse_satisfy(cf, server);
     } else if (ngx_strcmp(value[0].data, "referral") == 0) {
         return ngx_http_auth_ldap_parse_referral(cf, server);
+    } else if (ngx_strcmp(value[0].data, "max_down_retries") == 0) {
+        i = ngx_atoi(value[1].data, value[1].len);
+        if (i == NGX_ERROR) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "http_auth_ldap: 'max_down_retries' value must be an integer: using default of 0");
+            i = 0;
+        }
+        server->max_down_retries = i;
     } else if (ngx_strcmp(value[0].data, "connections") == 0) {
         i = ngx_atoi(value[1].data, value[1].len);
         if (i == NGX_ERROR || i == 0) {
@@ -1393,8 +1404,13 @@ ngx_http_auth_ldap_ssl_handshake(ngx_http_auth_ldap_connection_t *c)
     if (c->server->ssl_check_cert) {
       // load CA certificates: custom ones if specified, default ones instead
       if (c->server->ssl_ca_file.data || c->server->ssl_ca_dir.data) {
+#if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
+        int setcode = SSL_CTX_load_verify_locations(transport->ssl->session_ctx,
+          (char*)(c->server->ssl_ca_file.data), (char*)(c->server->ssl_ca_dir.data));
+#else
         int setcode = SSL_CTX_load_verify_locations(transport->ssl->connection->ctx,
           (char*)(c->server->ssl_ca_file.data), (char*)(c->server->ssl_ca_dir.data));
+#endif
         if (setcode != 1) {
           unsigned long error_code = ERR_get_error();
           char *error_msg = ERR_error_string(error_code, NULL);
@@ -1403,7 +1419,11 @@ ngx_http_auth_ldap_ssl_handshake(ngx_http_auth_ldap_connection_t *c)
             "Error: %lu, %s", error_code, error_msg);
         }
       }
+#if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
+      int setcode = SSL_CTX_set_default_verify_paths(transport->ssl->session_ctx);
+#else
       int setcode = SSL_CTX_set_default_verify_paths(transport->ssl->connection->ctx);
+#endif
       if (setcode != 1) {
         unsigned long error_code = ERR_get_error();
         char *error_msg = ERR_error_string(error_code, NULL);
@@ -1501,6 +1521,25 @@ ngx_http_auth_ldap_read_handler(ngx_event_t *rev)
             ngx_log_error(NGX_LOG_ERR, c->log, 0, "http_auth_ldap: ldap_result() failed (%d: %s)",
                 rc, ldap_err2string(rc));
             ngx_http_auth_ldap_close_connection(c);
+
+            // if LDAP_SERVER_DOWN (usually timeouts or server disconnects)
+            if (rc == LDAP_SERVER_DOWN && \
+                c->server->max_down_retries_count < c->server->max_down_retries) { 
+                /** 
+                    update counter (this is always reset in 
+                    ngx_http_auth_ldap_connect() for a successful ldap 
+                    connection  
+                **/
+                c->server->max_down_retries_count++;
+                ngx_log_error(NGX_LOG_ERR, c->log, 0, "http_auth_ldap: LDAP_SERVER_DOWN: retry count: %d",
+                    c->server->max_down_retries_count);
+                c->state = STATE_DISCONNECTED;
+                // immediate reconnect synchronously, this schedules another
+                // timer call to this read handler again
+                ngx_http_auth_ldap_reconnect_handler(rev);
+                return;
+            } 
+
             return;
         }
         if (rc == 0) {
@@ -1640,7 +1679,7 @@ ngx_http_auth_ldap_connect(ngx_http_auth_ldap_connection_t *c)
     ngx_add_timer(conn->read, c->server->connect_timeout);
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "http_auth_ldap: connect_timeout=%d.", c->server->connect_timeout);
 
-
+    c->server->max_down_retries_count = 0;   /* reset retries count */
     c->state = STATE_CONNECTING;
 }
 
@@ -1756,6 +1795,13 @@ ngx_http_auth_ldap_handler(ngx_http_request_t *r)
     alcf = ngx_http_get_module_loc_conf(r, ngx_http_auth_ldap_module);
     if (alcf->realm.len == 0) {
         return NGX_DECLINED;
+    }
+
+    if (alcf->servers == NULL || alcf->servers->nelts == 0) {
+        /* No LDAP servers for the location. */
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: \"auth_ldap\" requires "
+                      "one or more \"auth_ldap_servers\" in the same location");
+        return ngx_http_auth_ldap_set_realm(r, &alcf->realm);
     }
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_auth_ldap_module);
